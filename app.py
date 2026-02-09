@@ -441,19 +441,28 @@ st.code(share_text, language="text")
 # ---------------------------
 with st.expander("📎 API 안내 / 문제 해결", expanded=False):
     st.markdown(
-        """
-**1) OpenAI API Key**
-- OpenAI 키가 있어야 '컨디션 리포트'가 생성돼요.
+        '''
+### 1) OpenAI API Key
+- AI 리포트 생성을 위해 필요합니다.
 - 사이드바에 입력하거나 환경변수 `OPENAI_API_KEY`로 설정하세요.
 
-**2) OpenWeatherMap API Key**
-- 날씨 카드는 OpenWeatherMap 키가 있어야 동작해요.
+### 2) OpenWeatherMap API Key
+- 현재 도시의 날씨 정보를 가져오기 위해 필요합니다.
 - 사이드바에 입력하거나 환경변수 `OPENWEATHERMAP_API_KEY`로 설정하세요.
 
-**3) Dog CEO**
-- 강아지 이미지는 무료 공개 API라 키가 필요 없어요.
-- 네트워크가 불안정하면 실패할 수 있어요(실패 시 None 처리).
+### 3) 강아지 이미지 API
+- 무료 공개 API(Dog CEO)를 사용합니다.
+- API Key는 필요하지 않습니다.
+- 네트워크 문제 시 이미지가 표시되지 않을 수 있습니다.
 
-**4) 실행**
-```bash
-streamlit run app.py'''
+### 4) 실행 방법
+터미널에서 아래 명령어를 실행하세요:
+
+streamlit run app.py
+
+### 5) 필요한 라이브러리 설치
+설치가 안 되어 있다면 먼저 실행하세요:
+
+pip install streamlit pandas requests openai
+'''
+    )
