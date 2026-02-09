@@ -1,360 +1,344 @@
 import calendar
 import os
-import re
-from datetime import date, datetime, timedelta
+import sqlite3
+from datetime import date, datetime
 
 import pandas as pd
-import requests
 import streamlit as st
 
-st.set_page_config(page_title="AI 습관 트래커", page_icon="📊", layout="wide")
-st.title("📊 AI 습관 트래커 (Advanced)")
-
-HABITS = [
-    ("wake", "🌅", "기상 미션"),
-    ("water", "💧", "물 마시기"),
-    ("study", "📚", "공부/독서"),
-    ("workout", "🏋️", "운동하기"),
-    ("sleep", "😴", "수면"),
+DB_PATH = "habit_ai.db"
+INTERVIEW_FIELDS = [
+    ("last_food", "직전 먹은 음식이 무엇인가요?"),
+    ("sleep_hours", "오늘 수면시간은 몇 시간이었나요? (예: 6.5)"),
+    ("recent_workout_day", "최근 운동한 날짜/요일은 언제였나요?"),
+    ("recent_workout_part", "최근 운동한 부위는 어디였나요?"),
 ]
 
-CITIES = [
-    "Seoul",
-    "Busan",
-    "Incheon",
-    "Daegu",
-    "Daejeon",
-    "Gwangju",
-    "Ulsan",
-    "Suwon",
-    "Seongnam",
-    "Jeju",
-]
+st.set_page_config(page_title="Habit AI Coach", page_icon="🏋️", layout="wide")
 
-COACH_STYLES = {
-    "스파르타 코치": {
-        "system": (
-            "너는 엄격하지만 공정한 '스파르타 코치'다. "
-            "변명은 줄이고 실행 가능한 행동을 짧고 단호하게 제시한다."
+
+def init_db() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_logs (
+            log_date TEXT PRIMARY KEY,
+            last_food TEXT,
+            sleep_hours REAL,
+            recent_workout_day TEXT,
+            recent_workout_part TEXT,
+            created_at TEXT,
+            updated_at TEXT
         )
-    },
-    "따뜻한 멘토": {
-        "system": (
-            "너는 따뜻하고 공감적인 멘토다. "
-            "작은 성취를 인정하며 현실적인 다음 행동을 부드럽게 제안한다."
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS recommendations (
+            log_date TEXT PRIMARY KEY,
+            meal_plan TEXT,
+            workout_plan TEXT,
+            coach_note TEXT,
+            model_name TEXT,
+            generated_at TEXT
         )
-    },
-    "게임 마스터": {
-        "system": (
-            "너는 RPG 세계관의 게임 마스터다. "
-            "하루를 퀘스트와 스탯 관점으로 유쾌하게 해석하고 내일 미션을 제시한다."
-        )
-    },
-}
+        """
+    )
+    conn.commit()
+    conn.close()
 
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def safe_int(value, default=0):
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
-def iso(d: date) -> str:
-    return d.isoformat()
-
-
-def calc_achievement(habit_dict: dict) -> tuple[int, float]:
-    checked = sum(1 for key, _, _ in HABITS if bool(habit_dict.get(key)))
-    pct = round((checked / len(HABITS)) * 100, 1)
-    return checked, pct
-
-
-def get_record_by_date(records: list[dict], target_iso: str) -> dict | None:
-    return next((r for r in records if r.get("date") == target_iso), None)
-
-
-def normalize_record(record: dict) -> dict:
-    out = {
-        "date": record.get("date", iso(date.today())),
-        "city": record.get("city", "Seoul"),
-        "mood": safe_int(record.get("mood"), 6),
+def get_log(log_date: str) -> dict | None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT log_date, last_food, sleep_hours, recent_workout_day, recent_workout_part
+        FROM daily_logs
+        WHERE log_date = ?
+        """,
+        (log_date,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "log_date": row[0],
+        "last_food": row[1] or "",
+        "sleep_hours": row[2] if row[2] is not None else None,
+        "recent_workout_day": row[3] or "",
+        "recent_workout_part": row[4] or "",
     }
-    for key, _, _ in HABITS:
-        out[key] = bool(record.get(key))
+
+
+def upsert_log(record: dict) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO daily_logs (
+            log_date, last_food, sleep_hours, recent_workout_day, recent_workout_part, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(log_date) DO UPDATE SET
+            last_food=excluded.last_food,
+            sleep_hours=excluded.sleep_hours,
+            recent_workout_day=excluded.recent_workout_day,
+            recent_workout_part=excluded.recent_workout_part,
+            updated_at=excluded.updated_at
+        """,
+        (
+            record["log_date"],
+            record.get("last_food", ""),
+            record.get("sleep_hours", None),
+            record.get("recent_workout_day", ""),
+            record.get("recent_workout_part", ""),
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recommendation(log_date: str) -> dict | None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT meal_plan, workout_plan, coach_note, model_name, generated_at
+        FROM recommendations
+        WHERE log_date = ?
+        """,
+        (log_date,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "meal_plan": row[0],
+        "workout_plan": row[1],
+        "coach_note": row[2],
+        "model_name": row[3],
+        "generated_at": row[4],
+    }
+
+
+def upsert_recommendation(log_date: str, meal_plan: str, workout_plan: str, coach_note: str, model_name: str) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO recommendations (log_date, meal_plan, workout_plan, coach_note, model_name, generated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(log_date) DO UPDATE SET
+            meal_plan=excluded.meal_plan,
+            workout_plan=excluded.workout_plan,
+            coach_note=excluded.coach_note,
+            model_name=excluded.model_name,
+            generated_at=excluded.generated_at
+        """,
+        (log_date, meal_plan, workout_plan, coach_note, model_name, now),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recent_logs(limit: int = 14) -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT log_date, last_food, sleep_hours, recent_workout_day, recent_workout_part
+        FROM daily_logs
+        ORDER BY log_date DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "log_date": r[0],
+                "last_food": r[1] or "",
+                "sleep_hours": r[2] if r[2] is not None else None,
+                "recent_workout_day": r[3] or "",
+                "recent_workout_part": r[4] or "",
+            }
+        )
     return out
 
 
-def init_sample_data() -> list[dict]:
-    base = date.today() - timedelta(days=27)
-    demo = []
-    for i in range(28):
-        d = base + timedelta(days=i)
-        weekday = d.weekday()
-        rec = {
-            "date": iso(d),
-            "city": "Seoul",
-            "wake": weekday <= 4,
-            "water": weekday != 6,
-            "study": weekday in [0, 1, 2, 3, 5],
-            "workout": weekday in [1, 3, 5],
-            "sleep": weekday not in [4],
-            "mood": [6, 7, 7, 6, 5, 8, 7][weekday],
+def get_month_map(year: int, month: int) -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    start = f"{year:04d}-{month:02d}-01"
+    end = f"{year:04d}-{month:02d}-31"
+    cur.execute(
+        """
+        SELECT log_date, last_food, sleep_hours, recent_workout_part
+        FROM daily_logs
+        WHERE log_date BETWEEN ? AND ?
+        ORDER BY log_date ASC
+        """,
+        (start, end),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    result = {}
+    for row in rows:
+        result[row[0]] = {
+            "last_food": row[1] or "",
+            "sleep_hours": row[2],
+            "recent_workout_part": row[3] or "",
         }
-        demo.append(rec)
-    return demo
+    return result
 
 
-def ensure_state():
-    if "history" not in st.session_state:
-        st.session_state.history = init_sample_data()
-    if "last_context" not in st.session_state:
-        st.session_state.last_context = None
-    if "last_report" not in st.session_state:
-        st.session_state.last_report = ""
+def parse_ai_sections(text: str) -> tuple[str, str, str]:
+    meal, workout, note = "", "", ""
+    lines = [ln.strip() for ln in text.splitlines()]
+    mode = None
+    for ln in lines:
+        if ln.startswith("식사 코칭"):
+            mode = "meal"
+            continue
+        if ln.startswith("운동 코칭"):
+            mode = "workout"
+            continue
+        if ln.startswith("한 줄 코치"):
+            mode = "note"
+            continue
+        if not ln:
+            continue
+        if mode == "meal":
+            meal += (ln + "\n")
+        elif mode == "workout":
+            workout += (ln + "\n")
+        elif mode == "note":
+            note += (ln + "\n")
+
+    return meal.strip(), workout.strip(), note.strip()
 
 
-def upsert_record(record: dict):
-    target = record.get("date")
-    history = st.session_state.history
-    idx = next((i for i, r in enumerate(history) if r.get("date") == target), None)
-    if idx is None:
-        history.append(record)
-    else:
-        history[idx] = record
-    history = sorted(history, key=lambda r: r.get("date", ""))
-    st.session_state.history = history[-365:]
-
-
-# ---------------------------
-# API Layer
-# ---------------------------
-@st.cache_data(ttl=600)
-def get_weather(city: str, api_key: str):
-    if not api_key:
-        return None
-    try:
-        url = "https://api.openweathermap.org/data/2.5/weather"
-        params = {
-            "q": city,
-            "appid": api_key,
-            "units": "metric",
-            "lang": "kr",
-        }
-        res = requests.get(url, params=params, timeout=10)
-        if res.status_code != 200:
-            return None
-        data = res.json()
-        return {
-            "city": city,
-            "temp": data.get("main", {}).get("temp"),
-            "feels_like": data.get("main", {}).get("feels_like"),
-            "humidity": data.get("main", {}).get("humidity"),
-            "desc": (data.get("weather") or [{}])[0].get("description"),
-            "icon": (data.get("weather") or [{}])[0].get("icon"),
-        }
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=600)
-def get_dog_image():
-    try:
-        res = requests.get("https://dog.ceo/api/breeds/image/random", timeout=10)
-        if res.status_code != 200:
-            return None
-        payload = res.json()
-        if payload.get("status") != "success":
-            return None
-        url = payload.get("message")
-        if not url:
-            return None
-        m = re.search(r"/breeds/([^/]+)/", url)
-        breed = (m.group(1).replace("-", " ").strip() if m else "알 수 없음") or "알 수 없음"
-        return {"url": url, "breed": breed}
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=1800)
-def get_quote():
-    """ZenQuotes 오늘의 명언."""
-    try:
-        res = requests.get("https://zenquotes.io/api/today", timeout=10)
-        if res.status_code != 200:
-            return None
-        payload = res.json()
-        if not payload or not isinstance(payload, list):
-            return None
-        item = payload[0]
-        return {
-            "quote": item.get("q", ""),
-            "author": item.get("a", ""),
-        }
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=1800)
-def get_advice():
-    """Advice Slip 랜덤 조언."""
-    try:
-        res = requests.get("https://api.adviceslip.com/advice", timeout=10)
-        if res.status_code != 200:
-            return None
-        payload = res.json()
-        advice = (payload.get("slip") or {}).get("advice")
-        if not advice:
-            return None
-        return {"advice": advice}
-    except Exception:
-        return None
-
-
-def fetch_context(city: str, owm_key: str) -> dict:
-    return {
-        "weather": get_weather(city, owm_key),
-        "dog": get_dog_image(),
-        "quote": get_quote(),
-        "advice": get_advice(),
-        "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-
-# ---------------------------
-# AI Report
-# ---------------------------
-def generate_report(openai_api_key: str, coach_style: str, record: dict, context: dict):
+def generate_recommendation(openai_api_key: str, model_name: str, today_record: dict, history: list[dict]):
     if not openai_api_key:
-        return None, "OpenAI API Key가 필요합니다."
+        return None, "OpenAI API Key를 입력하세요."
 
     try:
         from openai import OpenAI
 
-        checked, pct = calc_achievement(record)
-        habit_lines = [
-            f"- {emoji} {label}: {'✅' if record.get(key) else '❌'}"
-            for key, emoji, label in HABITS
-        ]
+        history_text = "\n".join(
+            [
+                f"- {h['log_date']} | 음식:{h['last_food']} | 수면:{h['sleep_hours']}h | 최근운동:{h['recent_workout_day']} ({h['recent_workout_part']})"
+                for h in history
+            ]
+        )
+        if not history_text:
+            history_text = "기록 없음"
 
-        weather = (context or {}).get("weather")
-        weather_text = "없음"
-        if weather:
-            weather_text = (
-                f"{weather.get('city')} {weather.get('desc')}, "
-                f"{weather.get('temp')}도 (체감 {weather.get('feels_like')}도), 습도 {weather.get('humidity')}%"
-            )
+        prompt = f"""
+사용자는 오늘 아래 상태다.
+- 날짜: {today_record['log_date']}
+- 직전 음식: {today_record['last_food']}
+- 수면시간: {today_record['sleep_hours']}시간
+- 최근 운동일: {today_record['recent_workout_day']}
+- 최근 운동 부위: {today_record['recent_workout_part']}
 
-        dog = (context or {}).get("dog") or {}
-        quote = (context or {}).get("quote") or {}
-        advice = (context or {}).get("advice") or {}
+최근 기록:
+{history_text}
 
-        system_prompt = COACH_STYLES.get(coach_style, COACH_STYLES["따뜻한 멘토"])["system"]
+역할:
+- 생활 패턴 기반 코치
+- 오늘의 식사 방향과 근력운동 방향을 제시
 
-        user_prompt = f"""
-[체크인 날짜]
-{record.get('date')}
+제약:
+- 한국어
+- 과도한 의료 조언 금지
+- 초보자도 실행 가능한 구체적 분량 제공
 
-[요약]
-달성률: {pct}% ({checked}/{len(HABITS)})
-기분: {record.get('mood')}/10
-
-[습관 상세]
-{chr(10).join(habit_lines)}
-
-[외부 API 컨텍스트]
-- 날씨: {weather_text}
-- 강아지 품종: {dog.get('breed', '없음')}
-- 명언: {quote.get('quote', '없음')} / {quote.get('author', '')}
-- 조언: {advice.get('advice', '없음')}
-
-요구사항:
-1) 한국어로만 작성
-2) 아래 형식을 정확히 지킬 것
-3) 컨디션 등급은 S/A/B/C/D 중 하나
-
-형식:
-컨디션 등급: <S|A|B|C|D>
-
-핵심 분석:
+출력 형식(정확히):
+식사 코칭:
 - 3~5줄
 
-내일 액션:
-- 최대 3개 체크리스트
+운동 코칭:
+- 준비운동 1줄
+- 본운동 3~5개 (세트x반복 또는 시간 포함)
+- 마무리 1줄
 
-코치 한마디:
-- 한 줄
+한 줄 코치:
+- 1줄
 """.strip()
 
-        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         client = OpenAI(api_key=openai_api_key)
         resp = client.chat.completions.create(
-            model=model,
+            model=model_name,
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {
+                    "role": "system",
+                    "content": "너는 식사/근력운동 코치다. 과학적으로 무리하지 않는 행동 계획을 제시한다.",
+                },
+                {"role": "user", "content": prompt},
             ],
-            temperature=0.7,
+            temperature=0.6,
         )
+
         text = (resp.choices[0].message.content or "").strip()
-        return text, None
+        meal, workout, note = parse_ai_sections(text)
+        if not meal:
+            meal = text
+        return {"raw": text, "meal": meal, "workout": workout, "note": note}, None
     except Exception as e:
         return None, f"OpenAI 호출 실패: {e}"
 
 
-# ---------------------------
-# Calendar / Stats
-# ---------------------------
-def build_history_df(records: list[dict]) -> pd.DataFrame:
-    if not records:
-        return pd.DataFrame()
-    df = pd.DataFrame(records).copy()
-    for key, _, _ in HABITS:
-        if key not in df.columns:
-            df[key] = False
-    df["checked"] = df.apply(lambda row: sum(bool(row.get(k)) for k, _, _ in HABITS), axis=1)
-    df["achievement_pct"] = (df["checked"] / len(HABITS) * 100).round(1)
-    df["date"] = pd.to_datetime(df["date"])
-    return df.sort_values("date")
+def apply_modern_style() -> None:
+    st.markdown(
+        """
+        <style>
+        .stApp {
+            background: radial-gradient(1200px 500px at 5% -10%, #e0f2fe 0%, transparent 60%),
+                        radial-gradient(1200px 500px at 100% 0%, #fef9c3 0%, transparent 55%),
+                        #f8fafc;
+        }
+        .hero-card {
+            border: 1px solid #e2e8f0;
+            background: rgba(255,255,255,0.85);
+            backdrop-filter: blur(4px);
+            border-radius: 16px;
+            padding: 18px 20px;
+            margin-bottom: 14px;
+        }
+        .hero-title {font-size: 1.5rem; font-weight: 700; color: #0f172a; margin-bottom: 4px;}
+        .hero-sub {color: #334155; font-size: 0.95rem;}
+        .calendar-wrap table {width:100%; border-collapse: collapse; table-layout: fixed;}
+        .calendar-wrap th {background:#f1f5f9; border:1px solid #dbeafe; padding:8px;}
+        .calendar-wrap td {height:80px; border:1px solid #dbeafe; vertical-align: top; padding:6px; background:#ffffffd9;}
+        .day {font-weight:700; color:#0f172a; font-size:13px;}
+        .chip {margin-top:4px; display:inline-block; padding:2px 6px; border-radius:999px; background:#0ea5e9; color:white; font-size:11px;}
+        .chip2 {margin-top:4px; display:inline-block; padding:2px 6px; border-radius:999px; background:#22c55e; color:white; font-size:11px;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
-def pct_to_color(pct: float) -> str:
-    if pct >= 80:
-        return "#166534"
-    if pct >= 60:
-        return "#15803d"
-    if pct >= 40:
-        return "#65a30d"
-    if pct >= 20:
-        return "#ca8a04"
-    return "#b91c1c"
-
-
-def render_month_calendar(year: int, month: int, records_map: dict):
+def render_month_calendar(year: int, month: int, month_map: dict) -> None:
     cal = calendar.Calendar(firstweekday=6)
     weeks = cal.monthdayscalendar(year, month)
     weekdays = ["일", "월", "화", "수", "목", "금", "토"]
 
-    html = [
-        """
-<style>
-.calendar-wrap table {width: 100%; border-collapse: collapse; table-layout: fixed;}
-.calendar-wrap th {padding: 8px; border: 1px solid #e5e7eb; background: #f8fafc;}
-.calendar-wrap td {height: 86px; vertical-align: top; border: 1px solid #e5e7eb; padding: 6px;}
-.calendar-day {font-weight: 700; margin-bottom: 4px;}
-.calendar-pill {display: inline-block; padding: 2px 6px; border-radius: 999px; color: white; font-size: 12px;}
-.calendar-mood {font-size: 12px; color: #334155; margin-top: 4px;}
-</style>
-<div class="calendar-wrap">
-<table>
-<thead><tr>
-"""
-    ]
-    for wd in weekdays:
-        html.append(f"<th>{wd}</th>")
+    html = ["<div class='calendar-wrap'><table><thead><tr>"]
+    for w in weekdays:
+        html.append(f"<th>{w}</th>")
     html.append("</tr></thead><tbody>")
 
     for week in weeks:
@@ -364,219 +348,213 @@ def render_month_calendar(year: int, month: int, records_map: dict):
                 html.append("<td></td>")
                 continue
             key = f"{year:04d}-{month:02d}-{d:02d}"
-            rec = records_map.get(key)
-            if rec:
-                _, pct = calc_achievement(rec)
-                mood = safe_int(rec.get("mood"), 0)
-                color = pct_to_color(pct)
+            row = month_map.get(key)
+            if row:
+                sleep = row.get("sleep_hours")
+                part = row.get("recent_workout_part", "")
                 html.append(
-                    f"<td><div class='calendar-day'>{d}</div>"
-                    f"<span class='calendar-pill' style='background:{color}'>{pct}%</span>"
-                    f"<div class='calendar-mood'>기분 {mood}/10</div></td>"
+                    f"<td><div class='day'>{d}</div>"
+                    f"<div class='chip'>수면 {sleep if sleep is not None else '-'}h</div>"
+                    f"<div class='chip2'>{part if part else '운동기록'}</div></td>"
                 )
             else:
-                html.append(f"<td><div class='calendar-day'>{d}</div></td>")
+                html.append(f"<td><div class='day'>{d}</div></td>")
         html.append("</tr>")
 
     html.append("</tbody></table></div>")
     st.markdown("".join(html), unsafe_allow_html=True)
 
 
-# ---------------------------
-# App start
-# ---------------------------
-ensure_state()
+def init_state() -> None:
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = [
+            {
+                "role": "assistant",
+                "content": "오늘 코칭용 체크인을 시작합니다. 먼저 직전 먹은 음식을 알려주세요.",
+            }
+        ]
+    if "interview_index" not in st.session_state:
+        st.session_state.interview_index = 0
+    if "draft_record" not in st.session_state:
+        st.session_state.draft_record = {
+            "last_food": "",
+            "sleep_hours": None,
+            "recent_workout_day": "",
+            "recent_workout_part": "",
+        }
 
-with st.sidebar:
-    st.header("🔑 API Keys")
-    openai_api_key = st.text_input("OpenAI API Key", type="password", value=os.getenv("OPENAI_API_KEY", ""))
-    owm_api_key = st.text_input(
-        "OpenWeatherMap API Key",
-        type="password",
-        value=os.getenv("OPENWEATHERMAP_API_KEY", ""),
-    )
-    st.caption("환경변수 OPENAI_API_KEY / OPENWEATHERMAP_API_KEY 도 사용 가능합니다.")
 
-st.subheader("✅ 날짜별 체크인")
+def reset_interview_with_date(selected_iso: str) -> None:
+    existing = get_log(selected_iso)
+    st.session_state.draft_record = {
+        "last_food": existing.get("last_food", "") if existing else "",
+        "sleep_hours": existing.get("sleep_hours", None) if existing else None,
+        "recent_workout_day": existing.get("recent_workout_day", "") if existing else "",
+        "recent_workout_part": existing.get("recent_workout_part", "") if existing else "",
+    }
+    st.session_state.interview_index = 0
+    st.session_state.chat_messages = [
+        {
+            "role": "assistant",
+            "content": "오늘 코칭용 체크인을 시작합니다. 먼저 직전 먹은 음식을 알려주세요.",
+        }
+    ]
 
-selected_date = st.date_input("기록할 날짜", value=date.today(), max_value=date.today())
-selected_iso = iso(selected_date)
 
-existing = normalize_record(get_record_by_date(st.session_state.history, selected_iso) or {"date": selected_iso})
+def handle_user_chat_input(user_text: str) -> None:
+    idx = st.session_state.interview_index
+    st.session_state.chat_messages.append({"role": "user", "content": user_text})
 
-col_l, col_r = st.columns(2, gap="large")
-today_habits = {}
-with col_l:
-    for key, emoji, label in HABITS[:3]:
-        today_habits[key] = st.checkbox(
-            f"{emoji} {label}",
-            value=bool(existing.get(key)),
-            key=f"habit_{selected_iso}_{key}",
+    if idx < len(INTERVIEW_FIELDS):
+        field, _ = INTERVIEW_FIELDS[idx]
+        if field == "sleep_hours":
+            try:
+                st.session_state.draft_record[field] = float(user_text.strip())
+            except Exception:
+                st.session_state.draft_record[field] = None
+        else:
+            st.session_state.draft_record[field] = user_text.strip()
+
+        st.session_state.interview_index += 1
+
+    next_idx = st.session_state.interview_index
+    if next_idx < len(INTERVIEW_FIELDS):
+        st.session_state.chat_messages.append(
+            {"role": "assistant", "content": INTERVIEW_FIELDS[next_idx][1]}
         )
-with col_r:
-    for key, emoji, label in HABITS[3:]:
-        today_habits[key] = st.checkbox(
-            f"{emoji} {label}",
-            value=bool(existing.get(key)),
-            key=f"habit_{selected_iso}_{key}",
+    else:
+        st.session_state.chat_messages.append(
+            {
+                "role": "assistant",
+                "content": "입력이 완료되었습니다. '기록 저장' 버튼을 눌러 캘린더에 저장하고 코칭을 생성하세요.",
+            }
         )
 
-mood = st.slider(
-    "🙂 기분 (1~10)",
-    min_value=1,
-    max_value=10,
-    value=safe_int(existing.get("mood"), 6),
-    step=1,
-    key=f"mood_{selected_iso}",
+
+init_db()
+init_state()
+apply_modern_style()
+
+st.markdown(
+    """
+<div class='hero-card'>
+  <div class='hero-title'>Food + Strength Coach AI</div>
+  <div class='hero-sub'>생활 패턴을 기록하고, 오늘의 식사 방향성과 근력운동 계획을 자동 코칭합니다.</div>
+</div>
+""",
+    unsafe_allow_html=True,
 )
 
-c1, c2 = st.columns(2, gap="large")
-with c1:
-    default_city_idx = CITIES.index(existing.get("city")) if existing.get("city") in CITIES else 0
-    city = st.selectbox("🌍 도시", CITIES, index=default_city_idx, key=f"city_{selected_iso}")
-with c2:
-    coach_style = st.radio("🧠 코치 스타일", list(COACH_STYLES.keys()), horizontal=True)
+with st.sidebar:
+    st.header("설정")
+    openai_api_key = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        value=os.getenv("OPENAI_API_KEY", ""),
+    )
+    model_name = st.text_input("모델", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    st.caption("권장: OPENAI_API_KEY 환경변수 사용")
 
-save_col, _ = st.columns([1, 2])
-with save_col:
-    if st.button("기록 저장 / 수정", type="primary"):
-        record = {"date": selected_iso, "city": city, "mood": mood}
-        record.update({k: bool(today_habits.get(k)) for k, _, _ in HABITS})
-        upsert_record(record)
-        st.success(f"{selected_iso} 기록을 저장했습니다.")
+selected_date = st.date_input("기록 날짜", value=date.today(), max_value=date.today())
+selected_iso = selected_date.isoformat()
 
-checked_cnt, achievement_pct = calc_achievement(today_habits)
-m1, m2, m3 = st.columns(3)
-m1.metric("달성률", f"{achievement_pct}%")
-m2.metric("달성 습관", f"{checked_cnt}/{len(HABITS)}")
-m3.metric("기분", f"{mood}/10")
+if st.button("대화 입력 초기화"):
+    reset_interview_with_date(selected_iso)
+    st.rerun()
 
-st.subheader("📅 달력 기반 습관 트래킹")
-records_map = {r["date"]: normalize_record(r) for r in st.session_state.history}
+col_chat, col_result = st.columns([1.1, 1], gap="large")
 
-left, right = st.columns([1, 1])
-with left:
-    cal_year = st.selectbox("연도", list(range(date.today().year - 2, date.today().year + 1)), index=2)
-with right:
-    cal_month = st.selectbox("월", list(range(1, 13)), index=date.today().month - 1)
+with col_chat:
+    st.subheader("💬 체크인 대화창")
+    for msg in st.session_state.chat_messages:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
 
-render_month_calendar(cal_year, cal_month, records_map)
+    user_input = st.chat_input("메시지를 입력하세요")
+    if user_input:
+        handle_user_chat_input(user_input)
+        st.rerun()
 
-st.subheader("📈 주간/월간 통계")
-df = build_history_df(st.session_state.history)
-if not df.empty:
-    st.line_chart(df.set_index("date")[["achievement_pct", "mood"]])
+    st.markdown("#### 현재 입력 값")
+    draft = st.session_state.draft_record
+    st.write(f"- 직전 음식: {draft.get('last_food') or '-'}")
+    st.write(f"- 수면시간: {draft.get('sleep_hours') if draft.get('sleep_hours') is not None else '-'}")
+    st.write(f"- 최근 운동일: {draft.get('recent_workout_day') or '-'}")
+    st.write(f"- 최근 운동 부위: {draft.get('recent_workout_part') or '-'}")
 
-    today_ts = pd.Timestamp(date.today())
-    week_from = today_ts - pd.Timedelta(days=6)
-    month_from = today_ts - pd.Timedelta(days=29)
-    week_avg = round(df[df["date"] >= week_from]["achievement_pct"].mean(), 1)
-    month_avg = round(df[df["date"] >= month_from]["achievement_pct"].mean(), 1)
-    best_day = df.loc[df["achievement_pct"].idxmax()]
-
-    s1, s2, s3 = st.columns(3)
-    s1.metric("최근 7일 평균", f"{week_avg}%")
-    s2.metric("최근 30일 평균", f"{month_avg}%")
-    s3.metric("최고 달성일", f"{best_day['date'].date()} ({best_day['achievement_pct']}%)")
-else:
-    st.info("통계를 표시할 기록이 없습니다.")
-
-st.subheader("🌐 API 허브")
-api_btn = st.button("외부 API 데이터 새로고침")
-if api_btn:
-    with st.spinner("API 데이터를 가져오는 중..."):
-        st.session_state.last_context = fetch_context(city, owm_api_key)
-
-context = st.session_state.last_context or {}
-weather = context.get("weather")
-dog = context.get("dog")
-quote = context.get("quote")
-advice = context.get("advice")
-
-k1, k2 = st.columns(2)
-with k1:
-    st.markdown("#### ☁️ 날씨")
-    if weather:
-        st.write(f"{weather.get('city')} / {weather.get('desc')}")
-        st.write(f"{weather.get('temp')}°C (체감 {weather.get('feels_like')}°C), 습도 {weather.get('humidity')}%")
-    else:
-        st.caption("날씨 데이터 없음 (키/네트워크 확인)")
-
-    st.markdown("#### 💬 명언")
-    if quote and quote.get("quote"):
-        st.write(f"\"{quote.get('quote')}\"")
-        if quote.get("author"):
-            st.caption(f"- {quote.get('author')}")
-    else:
-        st.caption("명언 데이터 없음")
-
-with k2:
-    st.markdown("#### 🐶 랜덤 강아지")
-    if dog and dog.get("url"):
-        st.caption(f"품종(추정): {dog.get('breed')}")
-        st.image(dog.get("url"), use_container_width=True)
-    else:
-        st.caption("강아지 데이터 없음")
-
-    st.markdown("#### 🧠 한 줄 조언")
-    if advice and advice.get("advice"):
-        st.write(advice.get("advice"))
-    else:
-        st.caption("조언 데이터 없음")
-
-if context.get("fetched_at"):
-    st.caption(f"API 갱신 시각: {context.get('fetched_at')}")
-
-st.subheader("🧾 AI 코치 리포트")
-if st.button("선택 날짜 리포트 생성", type="primary"):
-    with st.spinner("리포트 생성 중..."):
-        if not st.session_state.last_context:
-            st.session_state.last_context = fetch_context(city, owm_api_key)
-
-        report_record = {
-            "date": selected_iso,
-            "city": city,
-            "mood": mood,
-            **{k: bool(today_habits.get(k)) for k, _, _ in HABITS},
+    if st.button("기록 저장", type="primary"):
+        payload = {
+            "log_date": selected_iso,
+            "last_food": draft.get("last_food", "").strip(),
+            "sleep_hours": draft.get("sleep_hours", None),
+            "recent_workout_day": draft.get("recent_workout_day", "").strip(),
+            "recent_workout_part": draft.get("recent_workout_part", "").strip(),
         }
-        report, err = generate_report(
-            openai_api_key=openai_api_key,
-            coach_style=coach_style,
-            record=report_record,
-            context=st.session_state.last_context,
-        )
-        if err:
-            st.error(err)
-        else:
-            st.session_state.last_report = report
+        upsert_log(payload)
+        st.success(f"{selected_iso} 기록 저장 완료")
 
-if st.session_state.last_report:
-    st.markdown(st.session_state.last_report)
+with col_result:
+    st.subheader("🧠 오늘의 AI 코칭")
+    current_log = get_log(selected_iso)
+    if not current_log:
+        st.info("먼저 대화 입력 후 '기록 저장'을 눌러주세요.")
+    else:
+        if st.button("식사 + 근력운동 코칭 생성", type="primary"):
+            recent = get_recent_logs(14)
+            result, err = generate_recommendation(
+                openai_api_key=openai_api_key,
+                model_name=model_name,
+                today_record=current_log,
+                history=recent,
+            )
+            if err:
+                st.error(err)
+            else:
+                upsert_recommendation(
+                    log_date=selected_iso,
+                    meal_plan=result["meal"] or "",
+                    workout_plan=result["workout"] or "",
+                    coach_note=result["note"] or "",
+                    model_name=model_name,
+                )
+                st.success("AI 코칭 생성 완료")
+
+        rec = get_recommendation(selected_iso)
+        if rec:
+            st.markdown("**식사 코칭**")
+            st.write(rec.get("meal_plan") or "-")
+            st.markdown("**운동 코칭**")
+            st.write(rec.get("workout_plan") or "-")
+            st.markdown("**한 줄 코치**")
+            st.write(rec.get("coach_note") or "-")
+            st.caption(f"모델: {rec.get('model_name')} / 생성시각: {rec.get('generated_at')}")
+
+st.subheader("📅 캘린더 기록")
+cal_col1, cal_col2 = st.columns(2)
+with cal_col1:
+    cal_year = st.selectbox("연도", options=list(range(date.today().year - 1, date.today().year + 2)), index=1)
+with cal_col2:
+    cal_month = st.selectbox("월", options=list(range(1, 13)), index=date.today().month - 1)
+
+month_map = get_month_map(cal_year, cal_month)
+render_month_calendar(cal_year, cal_month, month_map)
+
+st.subheader("📊 최근 기록")
+recent_logs = get_recent_logs(30)
+if recent_logs:
+    df = pd.DataFrame(recent_logs)
+    df["sleep_hours"] = pd.to_numeric(df["sleep_hours"], errors="coerce")
+    df = df.sort_values("log_date")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.line_chart(df.set_index("log_date")[["sleep_hours"]])
 else:
-    st.caption("리포트를 생성하면 여기에 표시됩니다.")
+    st.caption("아직 저장된 기록이 없습니다.")
 
-st.subheader("📌 공유 텍스트")
-share_text = f"""[AI 습관 트래커]
-- 날짜: {selected_iso}
-- 도시: {city}
-- 달성률: {achievement_pct}% ({checked_cnt}/{len(HABITS)})
-- 기분: {mood}/10
-
-[습관]
-{chr(10).join([f"- {emoji} {label}: {'✅' if today_habits.get(key) else '❌'}" for key, emoji, label in HABITS])}
-
-[AI 리포트]
-{st.session_state.last_report if st.session_state.last_report else '(미생성)'}
-"""
-st.code(share_text, language="text")
-
-with st.expander("📎 실행 / API 안내"):
+with st.expander("실행 안내"):
     st.markdown(
         """
 - 실행: `streamlit run app.py`
-- 권장 설치: `pip install -r requirements.txt`
-- OpenAI 키: `OPENAI_API_KEY`
-- OpenWeatherMap 키: `OPENWEATHERMAP_API_KEY`
-- 추가 공개 API: Dog CEO, ZenQuotes, Advice Slip
+- 설치: `pip install -r requirements.txt`
+- 저장 방식: 앱 로컬 SQLite(`habit_ai.db`)
 """
     )
