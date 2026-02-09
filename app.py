@@ -456,4 +456,4 @@ with st.expander("📎 API 안내 / 문제 해결", expanded=False):
 
 **4) 실행**
 ```bash
-streamlit run app.py
+streamlit run app.py'''
